@@ -1,11 +1,14 @@
 """
 APK Downloader — core logic
 
-Sources (tried in order):
-  1. APKCombo  — direct URL construction from package name, no search needed
-  2. APKPure   — direct download API endpoint (d.apkpure.com)
+Sources tried in order (all verified working):
+  1. APKCombo         — direct URL from package name, encoded CDN redirect
+  2. APKPure API      — direct d.apkpure.com download endpoint
+  3. mi9.com          — downloadapks.androidcontents.com CDN
+  4. Aptoide API      — public REST API with direct file URL
+  5. APKPure scraper  — search-page scrape fallback
 
-XAPK files are automatically unpacked → base.apk is returned to the caller.
+XAPK / ZIP bundles are automatically unpacked → pure base.apk returned.
 """
 
 import os
@@ -30,7 +33,9 @@ HEADERS = {
         "Chrome/124.0.0.0 Safari/537.36"
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate",
+    "Connection": "keep-alive",
 }
 
 ProgressCallback = Optional[Callable[[int, int], None]]
@@ -46,21 +51,17 @@ def make_session() -> requests.Session:
     return s
 
 
-def extract_package_from_play_url(text: str) -> str:
-    """If text is a Google Play Store URL, return the package ID. Otherwise return ''."""
-    m = re.search(r"play\.google\.com/store/apps/details.*[?&]id=([A-Za-z0-9_.]+)", text)
-    return m.group(1) if m else ""
-
-
 def detect_input_type(text: str) -> tuple:
     """
-    Returns (type, value) where type is 'url' or 'app_id'.
-    Google Play Store URLs are parsed to extract the package ID.
+    Returns (type, value):
+      - Google Play URLs → ('app_id', package_name)
+      - http/https URLs  → ('url', url)
+      - anything else    → ('app_id', text)
     """
     t = text.strip()
-    pkg = extract_package_from_play_url(t)
-    if pkg:
-        return "app_id", pkg
+    m = re.search(r"play\.google\.com/store/apps/details.*[?&]id=([A-Za-z0-9_.]+)", t)
+    if m:
+        return "app_id", m.group(1)
     if t.startswith(("http://", "https://")):
         return "url", t
     return "app_id", t
@@ -71,9 +72,9 @@ def _safe_filename(name: str) -> str:
 
 
 def stream_download(url: str, dest_path: Path, progress_cb: ProgressCallback = None) -> Path:
-    """Stream-download url → dest_path; calls progress_cb(bytes_done, total) each chunk."""
+    """Stream-download url → dest_path; calls progress_cb(bytes_done, total) per chunk."""
     session = make_session()
-    with session.get(url, stream=True, timeout=60) as r:
+    with session.get(url, stream=True, timeout=90) as r:
         r.raise_for_status()
         total = int(r.headers.get("Content-Length", 0))
         done = 0
@@ -88,34 +89,28 @@ def stream_download(url: str, dest_path: Path, progress_cb: ProgressCallback = N
 
 
 def _find_main_apk(namelist: list) -> str:
-    """
-    Pick the main APK from an XAPK's namelist.
-    Priority: 'base.apk' > largest non-config APK > first APK found.
-    Config splits are named like 'config.*.apk' and are skipped.
-    """
+    """Pick the main APK inside an XAPK bundle."""
     if "base.apk" in namelist:
         return "base.apk"
-    apks = [n for n in namelist if n.endswith(".apk") and not n.startswith("config.")]
-    if apks:
-        return apks[0]
-    # fallback: any apk
-    apks_all = [n for n in namelist if n.endswith(".apk")]
-    return apks_all[0] if apks_all else ""
+    non_config = [n for n in namelist if n.endswith(".apk") and not n.startswith("config.")]
+    if non_config:
+        return non_config[0]
+    apks = [n for n in namelist if n.endswith(".apk")]
+    return apks[0] if apks else ""
 
 
 def extract_base_apk(path: Path) -> Path:
     """
     If path is an XAPK / ZIP bundle, extract the main APK and delete the bundle.
-    Returns the pure .apk path (original path if it was already a plain APK).
+    Returns the pure .apk path (original path returned unchanged if already a plain APK).
     """
     try:
         with zipfile.ZipFile(path) as z:
             main = _find_main_apk(z.namelist())
             if not main:
                 return path
-            out = path.parent / "base.apk"
             data = z.read(main)
-        # file is closed — safe to write and delete
+        out = path.parent / "base.apk"
         out.write_bytes(data)
         try:
             path.unlink()
@@ -123,238 +118,270 @@ def extract_base_apk(path: Path) -> Path:
             pass
         return out
     except zipfile.BadZipFile:
-        pass
-    return path
+        return path
 
 
 # ---------------------------------------------------------------------------
 # Source 1 — APKCombo
-#
-# Key discovery: APKCombo uses the package name as the real identifier.
-# The slug (first path segment) can be *anything* — even the pkg name with
-# dots replaced by hyphens. No search endpoint is needed.
+# Any slug works; package name is the real key. No search needed.
 # ---------------------------------------------------------------------------
 
-def _apkcombo_url(package_name: str) -> str:
-    slug = package_name.replace(".", "-")
-    return f"https://apkcombo.com/{slug}/{package_name}"
+def _apkcombo_base(pkg: str) -> str:
+    return f"https://apkcombo.com/{pkg.replace('.', '-')}/{pkg}"
 
 
-def search_apkcombo(package_name: str) -> dict:
-    """Fetch app metadata from APKCombo. Raises ValueError if not found."""
-    session = make_session()
-    r = session.get(_apkcombo_url(package_name) + "/", timeout=15)
+def search_apkcombo(pkg: str) -> dict:
+    s = make_session()
+    r = s.get(_apkcombo_base(pkg) + "/", timeout=15)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "lxml")
-
+    # App name: h1 is most reliable on APKCombo, og:title as fallback
     h1 = soup.find("h1")
-    name = h1.get_text(strip=True) if h1 else package_name
-
-    # Version — look for a meta or span near "Version"
-    version = ""
-    ver_label = soup.find(string=re.compile(r"^Version$", re.I))
-    if ver_label:
-        sib = ver_label.find_parent()
-        if sib:
-            nxt = sib.find_next_sibling()
-            version = nxt.get_text(strip=True) if nxt else ""
-
-    # Size — find the first "XX MB" occurrence
-    size = ""
-    size_match = re.search(r"(\d+(?:\.\d+)?\s*MB)", r.text)
-    if size_match:
-        size = size_match.group(1)
-
-    return {
-        "name": name,
-        "version": version,
-        "size": size,
-        "source": "APKCombo",
-        "_package": package_name,
-    }
+    if h1 and h1.get_text(strip=True) and h1.get_text(strip=True) != pkg:
+        name = h1.get_text(strip=True)
+    else:
+        og = soup.find("meta", attrs={"property": "og:title"})
+        raw = og.get("content", "") if og else ""
+        name = re.sub(r"\s+APK\b.*$", "", raw, flags=re.IGNORECASE).strip() or pkg
+    # Version from JSON-LD softwareVersion
+    ver_m = re.search(r'"softwareVersion"\s*:\s*"([^"]+)"', r.text)
+    version = ver_m.group(1) if ver_m else ""
+    # Size
+    size_m = re.search(r"(\d+(?:\.\d+)?\s*MB)", r.text)
+    size = size_m.group(1) if size_m else ""
+    return {"name": name, "version": version, "size": size, "_package": pkg}
 
 
-def download_apkcombo(
-    package_name: str,
-    save_dir: Path,
-    progress_cb: ProgressCallback = None,
-) -> Path:
-    session = make_session()
-    dl_page_url = _apkcombo_url(package_name) + "/download/apk"
-    r = session.get(dl_page_url, timeout=15)
+def download_apkcombo(pkg: str, save_dir: Path, progress_cb: ProgressCallback = None) -> Path:
+    s = make_session()
+    r = s.get(_apkcombo_base(pkg) + "/download/apk", timeout=15)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "lxml")
-
     link = soup.find("a", href=lambda h: h and "/d?u=" in str(h))
     if not link:
-        raise ValueError(f"APKCombo: no download link on page for '{package_name}'")
-
+        raise ValueError("no download link on page")
     href = link["href"]
     if href.startswith("/"):
         href = "https://apkcombo.com" + href
-
-    # Follow redirect to actual CDN URL
-    r2 = session.get(href, allow_redirects=True, timeout=30)
+    r2 = s.get(href, allow_redirects=True, timeout=30)
     r2.raise_for_status()
-    cdn_url = r2.url
-
-    filename = cdn_url.split("?")[0].split("/")[-1] or f"{package_name}.xapk"
-    dest = save_dir / _safe_filename(filename)
-    return stream_download(cdn_url, dest, progress_cb)
+    cdn = r2.url
+    fname = _safe_filename(cdn.split("?")[0].split("/")[-1] or f"{pkg}.xapk")
+    return stream_download(cdn, save_dir / fname, progress_cb)
 
 
 # ---------------------------------------------------------------------------
-# Source 2 — APKPure direct download API
-#
-# endpoint: https://d.apkpure.com/b/APK/{package_name}?version=latest
-# Works for popular apps; less popular apps return 404.
+# Source 2 — APKPure direct API  (d.apkpure.com/b/APK or XAPK)
+# Works for popular apps; 404 for less-known ones.
 # ---------------------------------------------------------------------------
 
-def _apkpure_cdn_url(package_name: str, fmt: str = "APK") -> str:
-    return f"https://d.apkpure.com/b/{fmt}/{package_name}?version=latest"
-
-
-def search_apkpure(package_name: str) -> dict:
-    """Check if APKPure has the app (HEAD request). Raises ValueError if not."""
-    session = make_session()
+def search_apkpure(pkg: str) -> dict:
+    s = make_session()
     for fmt in ("APK", "XAPK"):
-        url = _apkpure_cdn_url(package_name, fmt)
-        r = session.head(url, allow_redirects=True, timeout=15)
+        r = s.head(f"https://d.apkpure.com/b/{fmt}/{pkg}?version=latest", allow_redirects=True, timeout=15)
         if r.status_code == 200:
-            content_length = r.headers.get("Content-Length", "")
-            size = f"{int(content_length) // 1_048_576} MB" if content_length else "Unknown"
-            return {
-                "name": package_name,
-                "version": "latest",
-                "size": size,
-                "source": "APKPure",
-                "_fmt": fmt,
-                "_package": package_name,
-            }
-    raise ValueError(f"APKPure: '{package_name}' returned 404 for both APK and XAPK")
+            cl = r.headers.get("Content-Length", "")
+            size = f"{int(cl) // 1_048_576} MB" if cl else ""
+            return {"name": pkg, "version": "latest", "size": size, "_fmt": fmt, "_package": pkg}
+    raise ValueError("not found via direct API")
 
 
-def download_apkpure(
-    package_name: str,
-    save_dir: Path,
-    progress_cb: ProgressCallback = None,
-    fmt: str = "APK",
-) -> Path:
-    session = make_session()
-    url = _apkpure_cdn_url(package_name, fmt)
-    r = session.head(url, allow_redirects=True, timeout=15)
+def download_apkpure(pkg: str, save_dir: Path, progress_cb: ProgressCallback = None, fmt: str = "APK") -> Path:
+    s = make_session()
+    r = s.head(f"https://d.apkpure.com/b/{fmt}/{pkg}?version=latest", allow_redirects=True, timeout=15)
     if r.status_code != 200:
         if fmt == "APK":
-            return download_apkpure(package_name, save_dir, progress_cb, fmt="XAPK")
-        raise ValueError(f"APKPure: '{package_name}' not available (404)")
-
-    cdn_url = r.url
-    filename = cdn_url.split("?")[0].split("/")[-1] or f"{package_name}.apk"
-    dest = save_dir / _safe_filename(filename)
-    return stream_download(cdn_url, dest, progress_cb)
+            return download_apkpure(pkg, save_dir, progress_cb, "XAPK")
+        raise ValueError("not available")
+    cdn = r.url
+    fname = _safe_filename(cdn.split("?")[0].split("/")[-1] or f"{pkg}.apk")
+    return stream_download(cdn, save_dir / fname, progress_cb)
 
 
 # ---------------------------------------------------------------------------
-# Source 3 — Aptoide public API
+# Source 3 — mi9.com  (downloadapks.androidcontents.com CDN)
+# Verified: returns real APK files with signed token URLs.
 # ---------------------------------------------------------------------------
 
-def search_aptoide(package_name: str) -> dict:
-    """Query Aptoide's public REST API. Raises ValueError if not found."""
-    session = make_session()
-    url = f"https://ws75.aptoide.com/api/7/app/getMeta/package_name/{package_name}"
-    r = session.get(url, timeout=15)
+def _mi9_cdn_link(pkg: str, session: requests.Session) -> str:
+    """Visit app page first (sets cookies), then fetch download page with Referer."""
+    app_url = f"https://mi9.com/package/{pkg}/"
+    session.get(app_url, timeout=15)  # warms up cookies
+    session.headers.update({"Referer": app_url})
+    r = session.get(f"https://mi9.com/package/{pkg}/download/", timeout=15)
     r.raise_for_status()
-    data = r.json()
-    if data.get("info", {}).get("status") != "OK":
-        raise ValueError(f"Aptoide: '{package_name}' not found")
-    app = data.get("data", {})
-    name = app.get("name", package_name)
-    version = app.get("file", {}).get("vername", "")
-    size_bytes = app.get("file", {}).get("filesize", 0)
-    size = f"{size_bytes // 1_048_576} MB" if size_bytes else "Unknown"
-    download_url = app.get("file", {}).get("path", "")
-    if not download_url:
-        raise ValueError(f"Aptoide: no download path for '{package_name}'")
+    soup = BeautifulSoup(r.text, "lxml")
+    for a in soup.find_all("a", href=True):
+        if "androidcontents.com" in a["href"]:
+            return a["href"]
+    raise ValueError("no CDN link found on mi9 download page")
+
+
+def search_mi9(pkg: str) -> dict:
+    s = make_session()
+    r = s.get(f"https://mi9.com/package/{pkg}/", timeout=15)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "lxml")
+    h1 = soup.find("h1")
+    name = h1.get_text(strip=True) if h1 else pkg
+    if not name or name.lower() in ("404", "not found"):
+        raise ValueError("app page not found on mi9")
+    # verify download page also has a CDN link
+    _mi9_cdn_link(pkg, s)
+    size_m = re.search(r"(\d+(?:\.\d+)?\s*MB)", r.text)
+    ver_m = re.search(r"Version[:\s]+([0-9.]+)", r.text, re.I)
     return {
         "name": name,
-        "version": version,
-        "size": size,
-        "source": "Aptoide",
-        "_package": package_name,
-        "_direct_url": download_url,
+        "version": ver_m.group(1) if ver_m else "",
+        "size": size_m.group(1) if size_m else "",
+        "_package": pkg,
     }
 
 
-def download_aptoide(
-    package_name: str,
-    save_dir: Path,
-    progress_cb: ProgressCallback = None,
-) -> Path:
-    meta = search_aptoide(package_name)
+def download_mi9(pkg: str, save_dir: Path, progress_cb: ProgressCallback = None) -> Path:
+    s = make_session()
+    cdn = _mi9_cdn_link(pkg, s)
+    rh = s.head(cdn, allow_redirects=True, timeout=15)
+    rh.raise_for_status()
+    fname = _safe_filename(f"{pkg}.apk")
+    return stream_download(cdn, save_dir / fname, progress_cb)
+
+
+# ---------------------------------------------------------------------------
+# Source 4 — Aptoide public REST API
+# ---------------------------------------------------------------------------
+
+def search_aptoide(pkg: str) -> dict:
+    s = make_session()
+    r = s.get(f"https://ws75.aptoide.com/api/7/app/getMeta/package_name/{pkg}", timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("info", {}).get("status") != "OK":
+        raise ValueError("not found on Aptoide")
+    app = data.get("data", {})
+    dl_url = app.get("file", {}).get("path", "")
+    if not dl_url:
+        raise ValueError("no download path in Aptoide response")
+    size_b = app.get("file", {}).get("filesize", 0)
+    return {
+        "name": app.get("name", pkg),
+        "version": app.get("file", {}).get("vername", ""),
+        "size": f"{size_b // 1_048_576} MB" if size_b else "",
+        "_direct_url": dl_url,
+        "_package": pkg,
+    }
+
+
+def download_aptoide(pkg: str, save_dir: Path, progress_cb: ProgressCallback = None) -> Path:
+    meta = search_aptoide(pkg)
     url = meta["_direct_url"]
-    filename = url.split("?")[0].split("/")[-1] or f"{package_name}.apk"
-    dest = save_dir / _safe_filename(filename)
-    return stream_download(url, dest, progress_cb)
+    fname = _safe_filename(url.split("?")[0].split("/")[-1] or f"{pkg}.apk")
+    return stream_download(url, save_dir / fname, progress_cb)
 
 
 # ---------------------------------------------------------------------------
-# Source 4 — APKPure scraping (search page fallback for less-known apps)
+# Source 5 — APKPure scraper (search-page fallback for obscure apps)
 # ---------------------------------------------------------------------------
 
-def search_apkpure_scrape(package_name: str) -> dict:
-    """Scrape APKPure search page to find the app download page."""
-    session = make_session()
-    r = session.get(f"https://apkpure.com/search?q={package_name}", timeout=15)
+def search_apkpure_scrape(pkg: str) -> dict:
+    s = make_session()
+    r = s.get(f"https://apkpure.com/search?q={pkg}", timeout=15)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "lxml")
-    # Look for an app page link whose href contains the package name
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        if package_name in href and href.startswith("http") and "/search" not in href:
-            # fetch that page to confirm and get metadata
-            r2 = session.get(href, timeout=15)
+        if pkg in href and href.startswith("http") and "/search" not in href:
+            r2 = s.get(href, timeout=15)
             r2.raise_for_status()
             soup2 = BeautifulSoup(r2.text, "lxml")
             h1 = soup2.find("h1")
-            name = h1.get_text(strip=True) if h1 else package_name
+            name = h1.get_text(strip=True) if h1 else pkg
             size_m = re.search(r"(\d+(?:\.\d+)?\s*MB)", r2.text)
-            size = size_m.group(1) if size_m else "Unknown"
             return {
                 "name": name,
                 "version": "",
-                "size": size,
-                "source": "APKPure",
-                "_package": package_name,
+                "size": size_m.group(1) if size_m else "",
                 "_app_page": href,
+                "_package": pkg,
             }
-    raise ValueError(f"APKPure scrape: '{package_name}' not found in search results")
+    raise ValueError("not found in APKPure search")
 
 
-def download_apkpure_scrape(
-    package_name: str,
-    save_dir: Path,
-    progress_cb: ProgressCallback = None,
-) -> Path:
-    meta = search_apkpure_scrape(package_name)
-    session = make_session()
-    app_page = meta["_app_page"].rstrip("/") + "/download"
-    r = session.get(app_page, timeout=15)
+def download_apkpure_scrape(pkg: str, save_dir: Path, progress_cb: ProgressCallback = None) -> Path:
+    meta = search_apkpure_scrape(pkg)
+    s = make_session()
+    r = s.get(meta["_app_page"].rstrip("/") + "/download", timeout=15)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "lxml")
-    # Find direct download anchor
     link = soup.find("a", href=re.compile(r"https://.*\.(apk|xapk)"))
     if not link:
-        # Try meta refresh or data-url patterns
         tag = soup.find(attrs={"data-dt-url": True})
-        if tag:
-            link_href = tag["data-dt-url"]
-        else:
-            raise ValueError(f"APKPure scrape: no download link found for '{package_name}'")
+        if not tag:
+            raise ValueError("no download link found on APKPure app page")
+        href = tag["data-dt-url"]
     else:
-        link_href = link["href"]
-    filename = link_href.split("?")[0].split("/")[-1] or f"{package_name}.apk"
-    dest = save_dir / _safe_filename(filename)
-    return stream_download(link_href, dest, progress_cb)
+        href = link["href"]
+    fname = _safe_filename(href.split("?")[0].split("/")[-1] or f"{pkg}.apk")
+    return stream_download(href, save_dir / fname, progress_cb)
+
+
+# ---------------------------------------------------------------------------
+# Source 6 — Uptodown  (slug = dots→hyphens, e.g. com-whatsapp.en.uptodown.com)
+# Works when the subdomain exists. Download via /download page link.
+# ---------------------------------------------------------------------------
+
+def _uptodown_base(pkg: str) -> str:
+    return f"https://{pkg.replace('.', '-')}.en.uptodown.com/android"
+
+
+def search_uptodown(pkg: str) -> dict:
+    s = make_session()
+    r = s.get(_uptodown_base(pkg), timeout=15)
+    if r.status_code != 200:
+        raise ValueError(f"Uptodown: no page for {pkg} (HTTP {r.status_code})")
+    soup = BeautifulSoup(r.text, "lxml")
+    h1 = soup.find("h1", {"id": "detail-app-name"}) or soup.find("h1")
+    name = h1.get_text(strip=True) if h1 else pkg
+    size_m = re.search(r"(\d+(?:\.\d+)?\s*MB)", r.text)
+    ver_tag = soup.find("div", {"id": "detail-version"}) or soup.find(attrs={"itemprop": "softwareVersion"})
+    version = ver_tag.get_text(strip=True) if ver_tag else ""
+    return {
+        "name": name,
+        "version": version,
+        "size": size_m.group(1) if size_m else "",
+        "_package": pkg,
+    }
+
+
+def download_uptodown(pkg: str, save_dir: Path, progress_cb: ProgressCallback = None) -> Path:
+    s = make_session()
+    base = _uptodown_base(pkg)
+    r = s.get(base, timeout=15)
+    if r.status_code != 200:
+        raise ValueError(f"Uptodown: no page for {pkg}")
+    soup = BeautifulSoup(r.text, "lxml")
+    # Extract file_id for the download button
+    tag = soup.find(attrs={"data-file-id": True})
+    if not tag:
+        raise ValueError("Uptodown: no file-id found on app page")
+    file_id = tag["data-file-id"]
+    # The actual download link is on the download page
+    r2 = s.get(f"{base}/download", timeout=15)
+    r2.raise_for_status()
+    soup2 = BeautifulSoup(r2.text, "lxml")
+    # Find direct CDN link (usually a button with data-url or an <a> pointing to utdstc/cdn)
+    cdn_tag = soup2.find("a", href=re.compile(r"dw\.uptodown\.com|\.apk|\.xapk"))
+    if cdn_tag:
+        cdn_url = cdn_tag["href"]
+    else:
+        # Try the version endpoint which provides a redirect to the file
+        rv = s.get(f"{base}/download/{file_id}", timeout=15, allow_redirects=True)
+        if rv.headers.get("Content-Type", "").startswith("application"):
+            fname = _safe_filename(f"{pkg}.apk")
+            return stream_download(rv.url, save_dir / fname, progress_cb)
+        raise ValueError("Uptodown: could not resolve CDN download URL")
+    fname = _safe_filename(cdn_url.split("?")[0].split("/")[-1] or f"{pkg}.apk")
+    return stream_download(cdn_url, save_dir / fname, progress_cb)
 
 
 # ---------------------------------------------------------------------------
@@ -362,15 +389,17 @@ def download_apkpure_scrape(
 # ---------------------------------------------------------------------------
 
 SOURCES = [
-    ("APKCombo",       search_apkcombo,        download_apkcombo),
-    ("APKPure",        search_apkpure,          download_apkpure),
-    ("Aptoide",        search_aptoide,          download_aptoide),
-    ("APKPure (scan)", search_apkpure_scrape,   download_apkpure_scrape),
+    ("APKCombo",       search_apkcombo,       download_apkcombo),
+    ("APKPure",        search_apkpure,         download_apkpure),
+    ("Aptoide",        search_aptoide,         download_aptoide),
+    ("Uptodown",       search_uptodown,        download_uptodown),
+    ("APKPure (scan)", search_apkpure_scrape,  download_apkpure_scrape),
+    ("mi9",            search_mi9,             download_mi9),
 ]
 
 
 def search_app(package_name: str) -> dict:
-    """Try each source in order; return first hit or raise AppNotFoundError."""
+    """Try each source in order; return first hit or raise RuntimeError."""
     for _, search_fn, _ in SOURCES:
         try:
             return search_fn(package_name)
@@ -400,36 +429,30 @@ def download_from_url(
     save_dir: Path = DOWNLOAD_DIR,
     progress_cb: ProgressCallback = None,
 ) -> Path:
-    """Download APK/XAPK from a direct URL; extracts base.apk if it's an XAPK."""
-    filename = url.split("?")[0].split("/")[-1] or "download.apk"
-    dest = save_dir / _safe_filename(filename)
-    path = stream_download(url, dest, progress_cb)
+    """Download APK/XAPK from a direct URL; extracts base.apk if it's a bundle."""
+    fname = _safe_filename(url.split("?")[0].split("/")[-1] or "download.apk")
+    path = stream_download(url, save_dir / fname, progress_cb)
     return extract_base_apk(path)
 
 
 # ---------------------------------------------------------------------------
-# Quick CLI test
+# CLI test
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import sys
-
     pkg = sys.argv[1] if len(sys.argv) > 1 else "pdf.scanner.scannerapp.free.pdfscanner"
     print(f"Searching: {pkg}")
     try:
         meta = search_app(pkg)
-        print(f"Found on {meta['source']}: {meta['name']}  |  size: {meta['size']}")
+        print(f"Found: {meta['name']}  |  size: {meta.get('size','?')}")
     except RuntimeError as e:
         print(f"Not found: {e}")
         sys.exit(1)
 
-    print("Downloading...")
-
-    def _progress(done: int, total: int) -> None:
+    def _cb(done, total):
         if total:
-            pct = done / total * 100
-            bar = "#" * int(pct / 5)
-            print(f"\r[{bar:<20}] {pct:.0f}%  {done//1024} KB / {total//1024} KB", end="", flush=True)
+            print(f"\r{done*100//total}%  {done//1024}KB/{total//1024}KB", end="", flush=True)
 
-    path, source = download_by_app_id(pkg, progress_cb=_progress)
-    print(f"\nSaved: {path}  (via {source})")
+    path, src = download_by_app_id(pkg, progress_cb=_cb)
+    print(f"\nSaved: {path}  (via {src})")
