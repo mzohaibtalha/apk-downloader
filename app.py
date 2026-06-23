@@ -99,10 +99,12 @@ if search_clicked and user_input.strip():
                 meta = search_app(value)
                 meta["_package"] = value
                 st.session_state.meta = meta
-                # Load version history in the same spinner pass
-                st.session_state.versions = list_versions(value, limit=10)
             except RuntimeError:
                 st.session_state.search_error = "App not found. Please check the package ID and try again."
+        if st.session_state.meta:
+            with st.spinner("Loading version history…"):
+                # Store empty list on failure so the expander still renders
+                st.session_state.versions = list_versions(value, limit=10) or []
 
 # ---------------------------------------------------------------------------
 # Result card
@@ -160,24 +162,28 @@ if st.session_state.meta:
     # -----------------------------------------------------------------------
     # Version history
     # -----------------------------------------------------------------------
-    if not is_url and st.session_state.versions:
+    if not is_url and st.session_state.versions is not None:
         versions = st.session_state.versions
-        with st.expander(f"Version History  ({len(versions)} older versions available)"):
-            header_cols = st.columns([3, 2, 2, 2])
-            header_cols[0].markdown("**Version**")
-            header_cols[1].markdown("**Size**")
-            header_cols[2].markdown("**Date**")
-            header_cols[3].markdown("**Action**")
-            st.divider()
-            for i, v in enumerate(versions):
-                row = st.columns([3, 2, 2, 2])
-                row[0].write(v.get("version") or "—")
-                row[1].write(v.get("size") or "—")
-                row[2].write(v.get("date") or "—")
-                if row[3].button("⬇️", key=f"dl_v_{i}", help=f"Download v{v.get('version', '')}"):
-                    st.session_state.ver_dl_idx = i
-                    st.session_state.apk_bytes = None
-                    st.session_state.apk_filename = None
+        label = f"Version History  ({len(versions)} older versions)" if versions else "Version History"
+        with st.expander(label):
+            if not versions:
+                st.caption("Version history could not be loaded for this app.")
+            else:
+                header_cols = st.columns([3, 2, 2, 2])
+                header_cols[0].markdown("**Version**")
+                header_cols[1].markdown("**Size**")
+                header_cols[2].markdown("**Date**")
+                header_cols[3].markdown("**Action**")
+                st.divider()
+                for i, v in enumerate(versions):
+                    row = st.columns([3, 2, 2, 2])
+                    row[0].write(v.get("version") or "—")
+                    row[1].write(v.get("size") or "—")
+                    row[2].write(v.get("date") or "—")
+                    if row[3].button("⬇️", key=f"dl_v_{i}", help=f"Download v{v.get('version', '')}"):
+                        st.session_state.ver_dl_idx = i
+                        st.session_state.apk_bytes = None
+                        st.session_state.apk_filename = None
 
     # -----------------------------------------------------------------------
     # Download a selected older version

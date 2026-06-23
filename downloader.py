@@ -397,16 +397,39 @@ def _list_versions_apkcombo(pkg: str, limit: int) -> list:
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "lxml")
     results = []
-    for a in soup.find_all("a", href=re.compile(r"versionCode=\d+")):
-        href = a["href"]
+
+    # Pattern A: links with versionCode= query param
+    candidates = soup.find_all("a", href=re.compile(r"versionCode=\d+"))
+
+    # Pattern B: links containing /download/ and a version-like segment
+    if not candidates:
+        candidates = soup.find_all("a", href=re.compile(r"/download/[^/\"]+\d+[^/\"]*$"))
+
+    # Pattern C: any link inside .version-item / .variant / li elements
+    if not candidates:
+        for tag in soup.select("li, .version-item, .variant"):
+            a = tag.find("a", href=True)
+            if a and "/download/" in a.get("href", ""):
+                candidates.append(a)
+
+    for a in candidates:
+        href = a.get("href", "")
+        if not href:
+            continue
         if href.startswith("/"):
             href = "https://apkcombo.com" + href
-        ver_m = re.search(r"(\d+[\d.]+)", a.get_text(strip=True))
+
+        # Extract version number from link text or URL
+        text = a.get_text(separator=" ", strip=True)
+        ver_m = re.search(r"(\d+\.\d+[\d.]*)", text) or re.search(r"(\d+\.\d+[\d.]*)", href)
         version = ver_m.group(1) if ver_m else ""
+
         parent = a.parent or a
         size_m = re.search(r"\d+(?:\.\d+)?\s*MB", parent.get_text())
-        # Convert /download/phone or /download/apk?versionCode=X
-        dl_page = re.sub(r"/download/[^?]+", "/download/apk", href)
+
+        # Normalise to /download/apk keeping any query string
+        dl_page = re.sub(r"(/download/)[^/?]+", r"\1apk", href)
+
         results.append({
             "version": version,
             "size": size_m.group(0) if size_m else "",
@@ -416,6 +439,7 @@ def _list_versions_apkcombo(pkg: str, limit: int) -> list:
         })
         if len(results) >= limit:
             break
+
     if not results:
         raise ValueError("no old versions found on APKCombo")
     return results
