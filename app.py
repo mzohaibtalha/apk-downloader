@@ -1,7 +1,26 @@
+import re
 import tempfile
 from pathlib import Path
 
 import streamlit as st
+
+# Android version → min SDK number mapping
+_ANDROID_SDK = {
+    "5.0": 21, "5.1": 22, "6.0": 23, "7.0": 24, "7.1": 25,
+    "8.0": 26, "8.1": 27, "9.0": 28, "10.0": 29, "10": 29,
+    "11.0": 30, "11": 30, "12.0": 31, "12": 31,
+    "13.0": 33, "13": 33, "14.0": 34, "14": 34, "15.0": 35, "15": 35,
+}
+
+def _android_to_sdk(min_android: str) -> str:
+    """Convert 'Android 5.0+' → 'SDK 21', returns '—' if unknown."""
+    if not min_android:
+        return "—"
+    m = re.search(r"(\d+\.\d+|\d+)", min_android)
+    if not m:
+        return "—"
+    sdk = _ANDROID_SDK.get(m.group(1))
+    return f"SDK {sdk}" if sdk else "—"
 
 from downloader import (
     detect_input_type,
@@ -96,11 +115,11 @@ if st.session_state.meta:
             st.markdown(f"`{meta['_url']}`")
         else:
             st.success(f"✅  {meta.get('name', 'App found')}")
-            c1, c2 = st.columns(2)
-            v = meta.get("version") or "—"
-            s = meta.get("size") or "—"
-            c1.metric("Version", v)
-            c2.metric("Size", s)
+            cols = st.columns(4)
+            cols[0].metric("Version", meta.get("version") or "—")
+            cols[1].metric("File Size", meta.get("size") or "—")
+            cols[2].metric("Min Android", meta.get("min_android") or "—")
+            cols[3].metric("Min SDK", _android_to_sdk(meta.get("min_android", "")))
 
     st.divider()
 

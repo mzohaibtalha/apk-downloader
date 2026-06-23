@@ -149,7 +149,10 @@ def search_apkcombo(pkg: str) -> dict:
     # Size
     size_m = re.search(r"(\d+(?:\.\d+)?\s*MB)", r.text)
     size = size_m.group(1) if size_m else ""
-    return {"name": name, "version": version, "size": size, "_package": pkg}
+    # Min Android version (e.g. "5.0+")
+    req_m = re.search(r"Android\s+(\d+\.\d+\+?)", r.text)
+    min_android = f"Android {req_m.group(1)}" if req_m else ""
+    return {"name": name, "version": version, "size": size, "min_android": min_android, "_package": pkg}
 
 
 def download_apkcombo(pkg: str, save_dir: Path, progress_cb: ProgressCallback = None) -> Path:
