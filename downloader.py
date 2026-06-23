@@ -388,6 +388,117 @@ def download_uptodown(pkg: str, save_dir: Path, progress_cb: ProgressCallback = 
 
 
 # ---------------------------------------------------------------------------
+# Version history helpers
+# ---------------------------------------------------------------------------
+
+def _list_versions_apkcombo(pkg: str, limit: int) -> list:
+    s = make_session()
+    r = s.get(_apkcombo_base(pkg) + "/old-versions/", timeout=15)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "lxml")
+    results = []
+    for a in soup.find_all("a", href=re.compile(r"versionCode=\d+")):
+        href = a["href"]
+        if href.startswith("/"):
+            href = "https://apkcombo.com" + href
+        ver_m = re.search(r"(\d+[\d.]+)", a.get_text(strip=True))
+        version = ver_m.group(1) if ver_m else ""
+        parent = a.parent or a
+        size_m = re.search(r"\d+(?:\.\d+)?\s*MB", parent.get_text())
+        # Convert /download/phone or /download/apk?versionCode=X
+        dl_page = re.sub(r"/download/[^?]+", "/download/apk", href)
+        results.append({
+            "version": version,
+            "size": size_m.group(0) if size_m else "",
+            "date": "",
+            "_dl_page": dl_page,
+            "_source": "apkcombo",
+        })
+        if len(results) >= limit:
+            break
+    if not results:
+        raise ValueError("no old versions found on APKCombo")
+    return results
+
+
+def _list_versions_uptodown(pkg: str, limit: int) -> list:
+    s = make_session()
+    base = _uptodown_base(pkg)
+    r = s.get(base + "/versions", timeout=15)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "lxml")
+    results = []
+    for item in soup.select("[data-url], div.version-item, li.version"):
+        ver_tag = item.find(class_=re.compile(r"version|ver", re.I))
+        version = ver_tag.get_text(strip=True) if ver_tag else item.get_text(strip=True)[:20]
+        size_m = re.search(r"\d+(?:\.\d+)?\s*MB", item.get_text())
+        date_tag = item.find("time") or item.find(class_=re.compile(r"date", re.I))
+        date = date_tag.get_text(strip=True) if date_tag else ""
+        dl_url = item.get("data-url", "")
+        if not dl_url:
+            a = item.find("a", href=True)
+            dl_url = a["href"] if a else ""
+        if dl_url and not dl_url.startswith("http"):
+            dl_url = base.rstrip("/") + "/" + dl_url.lstrip("/")
+        if not dl_url:
+            continue
+        results.append({
+            "version": version,
+            "size": size_m.group(0) if size_m else "",
+            "date": date,
+            "_dl_page": dl_url,
+            "_source": "uptodown",
+        })
+        if len(results) >= limit:
+            break
+    if not results:
+        raise ValueError("no versions found on Uptodown")
+    return results
+
+
+def list_versions(pkg: str, limit: int = 10) -> list:
+    """Return up to `limit` older versions for pkg. Each dict: version, size, date, _dl_page, _source."""
+    for fn in (_list_versions_apkcombo, _list_versions_uptodown):
+        try:
+            return fn(pkg, limit)
+        except Exception:
+            continue
+    return []
+
+
+def _download_apkcombo_from_page(dl_page: str, pkg: str, save_dir: Path, progress_cb: ProgressCallback) -> Path:
+    s = make_session()
+    r = s.get(dl_page, timeout=15)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "lxml")
+    link = soup.find("a", href=lambda h: h and "/d?u=" in str(h))
+    if not link:
+        raise ValueError("no download link on APKCombo version page")
+    href = link["href"]
+    if href.startswith("/"):
+        href = "https://apkcombo.com" + href
+    r2 = s.get(href, allow_redirects=True, timeout=30)
+    r2.raise_for_status()
+    cdn = r2.url
+    fname = _safe_filename(cdn.split("?")[0].split("/")[-1] or f"{pkg}.apk")
+    path = stream_download(cdn, save_dir / fname, progress_cb)
+    return extract_base_apk(path)
+
+
+def download_version(pkg: str, version_info: dict, save_dir: Path, progress_cb: ProgressCallback = None) -> Path:
+    """Download a specific version given a dict returned by list_versions()."""
+    source = version_info.get("_source", "")
+    dl_page = version_info.get("_dl_page", "")
+    if source == "apkcombo":
+        return _download_apkcombo_from_page(dl_page, pkg, save_dir, progress_cb)
+    if source == "uptodown":
+        fname = _safe_filename(f"{pkg}.apk")
+        path = stream_download(dl_page, save_dir / fname, progress_cb)
+        return extract_base_apk(path)
+    raise ValueError(f"unknown source: {source}")
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
