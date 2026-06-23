@@ -78,9 +78,7 @@ if search_clicked and user_input.strip():
                 meta["_package"] = value
                 st.session_state.meta = meta
             except RuntimeError:
-                st.session_state.search_error = (
-                    "App not found. Please check the package ID and try again."
-                )
+                st.session_state.search_error = "App not found. Please check the package ID and try again."
 
 # ---------------------------------------------------------------------------
 # Result card
@@ -136,7 +134,7 @@ if st.session_state.meta:
 
         except Exception as e:
             progress_bar.empty()
-            st.error(f"❌  Download failed. Please try again. ({e})")
+            st.error("❌  Download failed. Please try again.")
 
 # ---------------------------------------------------------------------------
 # Save to device

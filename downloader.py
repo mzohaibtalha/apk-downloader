@@ -255,24 +255,128 @@ def download_apkpure(
 
 
 # ---------------------------------------------------------------------------
+# Source 3 — Aptoide public API
+# ---------------------------------------------------------------------------
+
+def search_aptoide(package_name: str) -> dict:
+    """Query Aptoide's public REST API. Raises ValueError if not found."""
+    session = make_session()
+    url = f"https://ws75.aptoide.com/api/7/app/getMeta/package_name/{package_name}"
+    r = session.get(url, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("info", {}).get("status") != "OK":
+        raise ValueError(f"Aptoide: '{package_name}' not found")
+    app = data.get("data", {})
+    name = app.get("name", package_name)
+    version = app.get("file", {}).get("vername", "")
+    size_bytes = app.get("file", {}).get("filesize", 0)
+    size = f"{size_bytes // 1_048_576} MB" if size_bytes else "Unknown"
+    download_url = app.get("file", {}).get("path", "")
+    if not download_url:
+        raise ValueError(f"Aptoide: no download path for '{package_name}'")
+    return {
+        "name": name,
+        "version": version,
+        "size": size,
+        "source": "Aptoide",
+        "_package": package_name,
+        "_direct_url": download_url,
+    }
+
+
+def download_aptoide(
+    package_name: str,
+    save_dir: Path,
+    progress_cb: ProgressCallback = None,
+) -> Path:
+    meta = search_aptoide(package_name)
+    url = meta["_direct_url"]
+    filename = url.split("?")[0].split("/")[-1] or f"{package_name}.apk"
+    dest = save_dir / _safe_filename(filename)
+    return stream_download(url, dest, progress_cb)
+
+
+# ---------------------------------------------------------------------------
+# Source 4 — APKPure scraping (search page fallback for less-known apps)
+# ---------------------------------------------------------------------------
+
+def search_apkpure_scrape(package_name: str) -> dict:
+    """Scrape APKPure search page to find the app download page."""
+    session = make_session()
+    r = session.get(f"https://apkpure.com/search?q={package_name}", timeout=15)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "lxml")
+    # Look for an app page link whose href contains the package name
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if package_name in href and href.startswith("http") and "/search" not in href:
+            # fetch that page to confirm and get metadata
+            r2 = session.get(href, timeout=15)
+            r2.raise_for_status()
+            soup2 = BeautifulSoup(r2.text, "lxml")
+            h1 = soup2.find("h1")
+            name = h1.get_text(strip=True) if h1 else package_name
+            size_m = re.search(r"(\d+(?:\.\d+)?\s*MB)", r2.text)
+            size = size_m.group(1) if size_m else "Unknown"
+            return {
+                "name": name,
+                "version": "",
+                "size": size,
+                "source": "APKPure",
+                "_package": package_name,
+                "_app_page": href,
+            }
+    raise ValueError(f"APKPure scrape: '{package_name}' not found in search results")
+
+
+def download_apkpure_scrape(
+    package_name: str,
+    save_dir: Path,
+    progress_cb: ProgressCallback = None,
+) -> Path:
+    meta = search_apkpure_scrape(package_name)
+    session = make_session()
+    app_page = meta["_app_page"].rstrip("/") + "/download"
+    r = session.get(app_page, timeout=15)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "lxml")
+    # Find direct download anchor
+    link = soup.find("a", href=re.compile(r"https://.*\.(apk|xapk)"))
+    if not link:
+        # Try meta refresh or data-url patterns
+        tag = soup.find(attrs={"data-dt-url": True})
+        if tag:
+            link_href = tag["data-dt-url"]
+        else:
+            raise ValueError(f"APKPure scrape: no download link found for '{package_name}'")
+    else:
+        link_href = link["href"]
+    filename = link_href.split("?")[0].split("/")[-1] or f"{package_name}.apk"
+    dest = save_dir / _safe_filename(filename)
+    return stream_download(link_href, dest, progress_cb)
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 SOURCES = [
-    ("APKCombo", search_apkcombo, download_apkcombo),
-    ("APKPure",  search_apkpure,  download_apkpure),
+    ("APKCombo",       search_apkcombo,        download_apkcombo),
+    ("APKPure",        search_apkpure,          download_apkpure),
+    ("Aptoide",        search_aptoide,          download_aptoide),
+    ("APKPure (scan)", search_apkpure_scrape,   download_apkpure_scrape),
 ]
 
 
 def search_app(package_name: str) -> dict:
-    """Try each source; return metadata dict of the first hit or raise RuntimeError."""
-    errors = []
-    for label, search_fn, _ in SOURCES:
+    """Try each source in order; return first hit or raise AppNotFoundError."""
+    for _, search_fn, _ in SOURCES:
         try:
             return search_fn(package_name)
-        except Exception as e:
-            errors.append(f"{label}: {e}")
-    raise RuntimeError("Not found on any source.\n" + "\n".join(errors))
+        except Exception:
+            continue
+    raise RuntimeError("App not found.")
 
 
 def download_by_app_id(
@@ -281,15 +385,14 @@ def download_by_app_id(
     progress_cb: ProgressCallback = None,
 ) -> tuple:
     """Download APK by package name. Returns (Path, source_label)."""
-    errors = []
     for label, _, dl_fn in SOURCES:
         try:
             path = dl_fn(package_name, save_dir, progress_cb)
             path = extract_base_apk(path)
             return path, label
-        except Exception as e:
-            errors.append(f"{label}: {e}")
-    raise RuntimeError("Download failed on all sources.\n" + "\n".join(errors))
+        except Exception:
+            continue
+    raise RuntimeError("App not found. Please check the package ID and try again.")
 
 
 def download_from_url(
